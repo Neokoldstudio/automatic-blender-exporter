@@ -38,6 +38,15 @@ class HeightmapBakerSettings(bpy.types.PropertyGroup):
         min=64,
         max=8192,
     )
+    render_engine: EnumProperty(
+        name="Render Engine",
+        description="Render engine to use for baking",
+        items=[
+            ('BLENDER_EEVEE', "Eevee", "Use Eevee for baking (faster, but may have artifacts)"),
+            ('CYCLES',       "Cycles", "Use Cycles for baking (slower, but more accurate)"),
+        ],
+        default='BLENDER_EEVEE',
+    )
     padding: FloatProperty(
         name="Padding",
         description="Ortho-scale multiplier — values above 1.0 add empty border around the mesh",
@@ -57,7 +66,7 @@ class HeightmapBakerSettings(bpy.types.PropertyGroup):
     )
     bit_depth: EnumProperty(
         name="Bit Depth",
-        items=[('8', "16-bit", ""), ('16', "16-bit", ""), ('32', "32-bit", "")],
+        items=[('8', "8-bit", ""), ('16', "16-bit", ""), ('32', "32-bit", "")],
         default='16'
     )
     output_dir: StringProperty(
@@ -92,6 +101,7 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
 
         RESOLUTION_X = cfg.resolution_x
         RESOLUTION_Y = cfg.resolution_y
+        RENDER_ENGINE = cfg.render_engine
         PADDING      = cfg.padding
         FILE_FORMAT  = cfg.file_format
         BIT_DEPTH = cfg.bit_depth
@@ -178,9 +188,9 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
         scene.render.film_transparent = False
 
         try:
-            scene.render.engine = 'BLENDER_EEVEE'
+            scene.render.engine = RENDER_ENGINE
         except Exception:
-            scene.render.engine = 'CYCLES'
+            scene.render.engine = 'BLENDER_EEVEE'
 
         # ── OUTPUT PATH ───────────────────────────────────────────────────
         if cfg.output_dir:
@@ -249,6 +259,7 @@ class VIEW3D_PT_heightmap_baker(bpy.types.Panel):
         # ── Options ───────────────────────────────────────────────────────
         box = layout.box()
         box.label(text="Options", icon='PREFERENCES')
+        box.prop(cfg, "render_engine")
         box.prop(cfg, "padding")
         box.prop(cfg, "file_format", expand=True)
         box.prop(cfg, "bit_depth", expand=True)
