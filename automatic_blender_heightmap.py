@@ -92,13 +92,18 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.active_object and context.active_object.type == 'MESH'
+        selected = [o for o in context.selected_objects if o.type == 'MESH']
+        return len(selected) > 0
 
     def execute(self, context):
 
         scene = context.scene
         cfg = scene.heightmap_baker
-        obj = context.active_object
+        
+        selected = [o for o in context.selected_objects if o.type == 'MESH']
+        if not selected:
+            self.report({'ERROR'}, "No mesh objects selected")
+            return {'CANCELLED'}
 
         # ------------------------------------------------------------------
         # Store original state
@@ -117,18 +122,25 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
             "look": scene.view_settings.look,
             "exposure": scene.view_settings.exposure,
             "gamma": scene.view_settings.gamma,
+            "visible_objects": [o.name for o in scene.objects if o.visible_get()],
         }
 
-        original_mat = obj.data.materials[0] if obj.data.materials else None
+        # Hide unselected objects
+        for obj in scene.objects:
+            if obj not in selected:
+                obj.hide_set(True)
+                obj.hide_render = True
 
         # ------------------------------------------------------------------
-        # Compute WORLD-SPACE height bounds
+        # Compute WORLD-SPACE height bounds (union of all selected)
         # ------------------------------------------------------------------
 
-        world_bb = [
-            obj.matrix_world @ mathutils.Vector(corner)
-            for corner in obj.bound_box
-        ]
+        world_bb = []
+        for obj in selected:
+            world_bb.extend([
+                obj.matrix_world @ mathutils.Vector(corner)
+                for corner in obj.bound_box
+            ])
 
         min_z = min(v.z for v in world_bb)
         max_z = max(v.z for v in world_bb)
@@ -155,8 +167,13 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
         # Camera setup (orthographic, top-down)
         # ------------------------------------------------------------------
 
-        size_x = max(v.x for v in world_bb) - min(v.x for v in world_bb)
-        size_y = max(v.y for v in world_bb) - min(v.y for v in world_bb)
+        min_x = min(v.x for v in world_bb)
+        max_x = max(v.x for v in world_bb)
+        min_y = min(v.y for v in world_bb)
+        max_y = max(v.y for v in world_bb)
+
+        size_x = max_x - min_x
+        size_y = max_y - min_y
 
         render_ratio = cfg.resolution_x / cfg.resolution_y
         mesh_ratio = size_x / size_y
@@ -165,8 +182,8 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
         ortho_scale *= cfg.padding
 
         center_xy = mathutils.Vector((
-            sum(v.x for v in world_bb) / 8,
-            sum(v.y for v in world_bb) / 8,
+            (min_x + max_x) / 2,
+            (min_y + max_y) / 2,
             max_z + 10.0,
         ))
 
@@ -204,10 +221,17 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
         links.new(n_map.outputs['Result'], n_emit.inputs['Color'])
         links.new(n_emit.outputs['Emission'], n_out.inputs['Surface'])
 
-        if obj.data.materials:
-            obj.data.materials[0] = mat
-        else:
-            obj.data.materials.append(mat)
+        # ------------------------------------------------------------------
+        # Apply material to all selected objects
+        # ------------------------------------------------------------------
+        
+        original_materials = {}
+        for obj in selected:
+            original_materials[obj.name] = obj.data.materials[0] if obj.data.materials else None
+            if obj.data.materials:
+                obj.data.materials[0] = mat
+            else:
+                obj.data.materials.append(mat)
 
         # ------------------------------------------------------------------
         # Render configuration (RAW linear output!)
@@ -223,7 +247,7 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
         scene.view_settings.look = 'None'
         scene.view_settings.exposure = 0.0
         scene.view_settings.gamma = 1.0
-        scene.render.film_transparent = True
+        scene.render.film_transparent = False
 
         # ------------------------------------------------------------------
         # Output path
@@ -237,7 +261,7 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
             out_dir = os.path.expanduser("~")
 
         ext = "exr" if cfg.file_format == 'OPEN_EXR' else "png"
-        output_path = os.path.join(out_dir, f"{obj.name}_heightmap.{ext}")
+        output_path = os.path.join(out_dir, f"heightmap.{ext}")
         scene.render.filepath = output_path
 
         # ------------------------------------------------------------------
@@ -250,14 +274,22 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
         # Cleanup and restore
         # ------------------------------------------------------------------
 
-        if original_mat:
-            obj.data.materials[0] = original_mat
-        else:
-            obj.data.materials.clear()
+        for obj in selected:
+            orig_mat = original_materials.get(obj.name)
+            if orig_mat:
+                obj.data.materials[0] = orig_mat
+            else:
+                obj.data.materials.clear()
 
         bpy.data.materials.remove(mat)
         bpy.data.worlds.remove(temp_world)
         bpy.data.objects.remove(cam, do_unlink=True)
+
+        # Restore visibility for all objects
+        for obj in scene.objects:
+            if obj.name in original["visible_objects"]:
+                obj.hide_set(False)
+                obj.hide_render = False
 
         scene.camera = original["camera"]
         scene.world = original["world"]
@@ -299,6 +331,7 @@ class VIEW3D_PT_heightmap_baker(bpy.types.Panel):
         layout.prop(cfg, "output_dir")
 
         layout.separator()
+        layout.label(text="Supports multiple selected objects", icon='INFO')
         layout.operator("object.bake_heightmap", icon='RENDER_STILL')
 
 # ---------------------------------------------------------------------------
