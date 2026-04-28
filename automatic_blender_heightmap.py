@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Heightmap Baker",
     "author": "Paul Godbert",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Tool > Heightmap Baker",
-    "description": "Bake an orthographic top-down heightmap from a selected mesh object",
+    "description": "Bake a true linear world-space heightmap from a selected mesh",
     "category": "Object",
 }
 
@@ -20,60 +20,64 @@ from bpy.props import (
 
 
 # ---------------------------------------------------------------------------
-# Properties stored on the Scene so they persist across operator calls
+# Properties
 # ---------------------------------------------------------------------------
 
 class HeightmapBakerSettings(bpy.types.PropertyGroup):
+
     resolution_x: IntProperty(
         name="Width",
-        description="Render resolution X",
         default=2048,
         min=64,
         max=8192,
     )
+
     resolution_y: IntProperty(
         name="Height",
-        description="Render resolution Y",
         default=2048,
         min=64,
         max=8192,
     )
+
     render_engine: EnumProperty(
         name="Render Engine",
-        description="Render engine to use for baking",
         items=[
-            ('BLENDER_EEVEE', "Eevee", "Use Eevee for baking (faster, but may have artifacts)"),
-            ('CYCLES',       "Cycles", "Use Cycles for baking (slower, but more accurate)"),
+            ('BLENDER_EEVEE', "Eevee", ""),
+            ('CYCLES', "Cycles", ""),
         ],
         default='BLENDER_EEVEE',
     )
+
     padding: FloatProperty(
         name="Padding",
-        description="Ortho-scale multiplier — values above 1.0 add empty border around the mesh",
+        description="Extra ortho framing around the mesh",
         default=1.0,
         min=0.01,
         soft_max=2.0,
-        step=1,
     )
+
     file_format: EnumProperty(
         name="Format",
-        description="Output image format",
         items=[
-            ('PNG',      "PNG",      "16-bit PNG"),
-            ('OPEN_EXR', "EXR",      "32-bit OpenEXR"),
+            ('PNG', "PNG", "16-bit PNG"),
+            ('OPEN_EXR', "EXR", "32-bit OpenEXR"),
         ],
         default='PNG',
     )
+
     bit_depth: EnumProperty(
         name="Bit Depth",
-        items=[('8', "8-bit", ""), ('16', "16-bit", ""), ('32', "32-bit", "")],
+        items=[
+            ('16', "16-bit", ""),
+            ('32', "32-bit", ""),
+        ],
         default='16'
     )
+
     output_dir: StringProperty(
-        name="Output Dir",
-        description="Directory to save the heightmap. Leave empty to use the .blend file directory (or home folder if unsaved)",
-        default="",
+        name="Output Directory",
         subtype='DIR_PATH',
+        default=""
     )
 
 
@@ -82,203 +86,220 @@ class HeightmapBakerSettings(bpy.types.PropertyGroup):
 # ---------------------------------------------------------------------------
 
 class OBJECT_OT_bake_heightmap(bpy.types.Operator):
-    bl_idname  = "object.bake_heightmap"
-    bl_label   = "Bake Heightmap"
-    bl_description = "Render a top-down orthographic heightmap of the active mesh"
+    bl_idname = "object.bake_heightmap"
+    bl_label = "Bake Heightmap"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        return (
-            context.active_object is not None
-            and context.active_object.type == 'MESH'
-        )
+        return context.active_object and context.active_object.type == 'MESH'
 
     def execute(self, context):
-        scene    = context.scene
-        cfg      = scene.heightmap_baker
-        obj      = context.active_object
 
-        RESOLUTION_X = cfg.resolution_x
-        RESOLUTION_Y = cfg.resolution_y
-        RENDER_ENGINE = cfg.render_engine
-        PADDING      = cfg.padding
-        FILE_FORMAT  = cfg.file_format
-        BIT_DEPTH = cfg.bit_depth
+        scene = context.scene
+        cfg = scene.heightmap_baker
+        obj = context.active_object
 
-        # ── STORE ORIGINAL STATE ──────────────────────────────────────────
-        original_camera   = scene.camera
-        original_material = obj.data.materials[0] if obj.data.materials else None
-        original_world    = scene.world
-        original_engine   = scene.render.engine
-        original_res_x    = scene.render.resolution_x
-        original_res_y    = scene.render.resolution_y
-        original_filepath = scene.render.filepath
-        original_format   = scene.render.image_settings.file_format
-        original_depth    = scene.render.image_settings.color_depth
-        original_film_transparent = scene.render.film_transparent
+        # ------------------------------------------------------------------
+        # Store original state
+        # ------------------------------------------------------------------
 
-        # ── TEMPORARY WORLD (pure black background) ───────────────────────
+        original = {
+            "camera": scene.camera,
+            "world": scene.world,
+            "engine": scene.render.engine,
+            "res_x": scene.render.resolution_x,
+            "res_y": scene.render.resolution_y,
+            "filepath": scene.render.filepath,
+            "format": scene.render.image_settings.file_format,
+            "depth": scene.render.image_settings.color_depth,
+            "view": scene.view_settings.view_transform,
+            "look": scene.view_settings.look,
+            "exposure": scene.view_settings.exposure,
+            "gamma": scene.view_settings.gamma,
+        }
+
+        original_mat = obj.data.materials[0] if obj.data.materials else None
+
+        # ------------------------------------------------------------------
+        # Compute WORLD-SPACE height bounds
+        # ------------------------------------------------------------------
+
+        world_bb = [
+            obj.matrix_world @ mathutils.Vector(corner)
+            for corner in obj.bound_box
+        ]
+
+        min_z = min(v.z for v in world_bb)
+        max_z = max(v.z for v in world_bb)
+
+        if max_z <= min_z:
+            self.report({'ERROR'}, "Object has zero height")
+            return {'CANCELLED'}
+
+        # ------------------------------------------------------------------
+        # Temporary world (black background)
+        # ------------------------------------------------------------------
+
         temp_world = bpy.data.worlds.new("TEMP_HEIGHT_WORLD")
         temp_world.use_nodes = True
-        temp_world.node_tree.nodes["Background"].inputs[0].default_value = (0, 0, 0, 1)
+
+        bg = temp_world.node_tree.nodes["Background"]
+        min_value = 0.0
+        bg.inputs["Color"].default_value = (min_value, min_value, min_value, 1)
+        bg.inputs["Strength"].default_value = 1.0
+
         scene.world = temp_world
 
-        # ── CALCULATE LOCAL BOUNDS ────────────────────────────────────────
-        bb = obj.bound_box  # 8 local-space corners
-        local_min = mathutils.Vector((
-            min(c[0] for c in bb),
-            min(c[1] for c in bb),
-            min(c[2] for c in bb),
+        # ------------------------------------------------------------------
+        # Camera setup (orthographic, top-down)
+        # ------------------------------------------------------------------
+
+        size_x = max(v.x for v in world_bb) - min(v.x for v in world_bb)
+        size_y = max(v.y for v in world_bb) - min(v.y for v in world_bb)
+
+        render_ratio = cfg.resolution_x / cfg.resolution_y
+        mesh_ratio = size_x / size_y
+
+        ortho_scale = size_x if mesh_ratio > render_ratio else size_y
+        ortho_scale *= cfg.padding
+
+        center_xy = mathutils.Vector((
+            sum(v.x for v in world_bb) / 8,
+            sum(v.y for v in world_bb) / 8,
+            max_z + 10.0,
         ))
-        local_max = mathutils.Vector((
-            max(c[0] for c in bb),
-            max(c[1] for c in bb),
-            max(c[2] for c in bb),
-        ))
-        local_center = (local_min + local_max) / 2
-        world_center = obj.matrix_world @ local_center
 
-        size_x = (local_max.x - local_min.x) * obj.scale.x
-        size_y = (local_max.y - local_min.y) * obj.scale.y
+        bpy.ops.object.camera_add(location=center_xy)
+        cam = context.object
+        cam.data.type = 'ORTHO'
+        cam.data.ortho_scale = ortho_scale
+        cam.rotation_euler = (0.0, 0.0, 0.0)
+        scene.camera = cam
 
-        # ── CAMERA SETUP (rotation-invariant) ────────────────────────────
-        mesh_ratio   = size_x / size_y
-        render_ratio = RESOLUTION_X / RESOLUTION_Y
-        ortho_scale  = (size_x / render_ratio) if mesh_ratio > render_ratio else size_y
+        # ------------------------------------------------------------------
+        # Temporary height material (WORLD Z → 0..1)
+        # ------------------------------------------------------------------
 
-        # Offset along the object's LOCAL +Z so the camera sits above it
-        inv_rot = obj.matrix_world.to_quaternion()
-        offset  = inv_rot @ mathutils.Vector((0, 0, 10))
-
-        bpy.ops.object.camera_add(location=world_center + offset)
-        temp_cam = context.object
-        temp_cam.name = "TEMP_HEIGHT_CAM"
-        temp_cam.rotation_euler       = obj.rotation_euler   # match object rotation
-        temp_cam.data.type            = 'ORTHO'
-        temp_cam.data.ortho_scale     = ortho_scale * PADDING
-        scene.camera                  = temp_cam
-
-        # ── TEMPORARY MATERIAL (Generated UV → Z → Emission) ─────────────
-        temp_mat = bpy.data.materials.new(name="TEMP_HEIGHT_MAT")
-        temp_mat.use_nodes = True
-        nodes = temp_mat.node_tree.nodes
+        mat = bpy.data.materials.new("TEMP_HEIGHT_MAT")
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
         nodes.clear()
 
-        n_tex  = nodes.new('ShaderNodeTexCoord')
-        n_sep  = nodes.new('ShaderNodeSeparateXYZ')
+        n_geo = nodes.new('ShaderNodeNewGeometry')
+        n_sep = nodes.new('ShaderNodeSeparateXYZ')
+        n_map = nodes.new('ShaderNodeMapRange')
         n_emit = nodes.new('ShaderNodeEmission')
-        n_out  = nodes.new('ShaderNodeOutputMaterial')
+        n_out = nodes.new('ShaderNodeOutputMaterial')
 
-        links = temp_mat.node_tree.links
-        links.new(n_tex.outputs['Generated'],  n_sep.inputs[0])
-        links.new(n_sep.outputs['Z'],          n_emit.inputs['Color'])
-        links.new(n_emit.outputs['Emission'],  n_out.inputs['Surface'])
+        n_map.inputs['From Min'].default_value = min_z
+        n_map.inputs['From Max'].default_value = max_z
+        n_map.inputs['To Min'].default_value = 0.0
+        n_map.inputs['To Max'].default_value = 1.0
+        n_map.clamp = True
+
+        links.new(n_geo.outputs['Position'], n_sep.inputs[0])
+        links.new(n_sep.outputs['Z'], n_map.inputs['Value'])
+        links.new(n_map.outputs['Result'], n_emit.inputs['Color'])
+        links.new(n_emit.outputs['Emission'], n_out.inputs['Surface'])
 
         if obj.data.materials:
-            obj.data.materials[0] = temp_mat
+            obj.data.materials[0] = mat
         else:
-            obj.data.materials.append(temp_mat)
+            obj.data.materials.append(mat)
 
-        # ── RENDER SETTINGS ───────────────────────────────────────────────
-        scene.render.resolution_x = RESOLUTION_X
-        scene.render.resolution_y = RESOLUTION_Y
-        scene.render.image_settings.file_format  = FILE_FORMAT
-        scene.render.image_settings.color_depth  = BIT_DEPTH
-        scene.render.film_transparent = False
+        # ------------------------------------------------------------------
+        # Render configuration (RAW linear output!)
+        # ------------------------------------------------------------------
 
-        try:
-            scene.render.engine = RENDER_ENGINE
-        except Exception:
-            scene.render.engine = 'BLENDER_EEVEE'
+        scene.render.engine = cfg.render_engine
+        scene.render.resolution_x = cfg.resolution_x
+        scene.render.resolution_y = cfg.resolution_y
+        scene.render.image_settings.file_format = cfg.file_format
+        scene.render.image_settings.color_depth = cfg.bit_depth
 
-        # ── OUTPUT PATH ───────────────────────────────────────────────────
+        scene.view_settings.view_transform = 'Raw'
+        scene.view_settings.look = 'None'
+        scene.view_settings.exposure = 0.0
+        scene.view_settings.gamma = 1.0
+        scene.render.film_transparent = True
+
+        # ------------------------------------------------------------------
+        # Output path
+        # ------------------------------------------------------------------
+
         if cfg.output_dir:
-            save_dir = bpy.path.abspath(cfg.output_dir)
+            out_dir = bpy.path.abspath(cfg.output_dir)
         elif bpy.data.is_saved:
-            save_dir = bpy.path.abspath("//")
+            out_dir = bpy.path.abspath("//")
         else:
-            save_dir = os.path.expanduser("~")
+            out_dir = os.path.expanduser("~")
 
-        extension   = "exr" if FILE_FORMAT == 'OPEN_EXR' else "png"
-        output_file = os.path.join(save_dir, f"{obj.name}_heightmap.{extension}")
-        scene.render.filepath = output_file
+        ext = "exr" if cfg.file_format == 'OPEN_EXR' else "png"
+        output_path = os.path.join(out_dir, f"{obj.name}_heightmap.{ext}")
+        scene.render.filepath = output_path
 
-        # ── RENDER ────────────────────────────────────────────────────────
-        print(f"[Heightmap Baker] Rendering → {output_file}")
+        # ------------------------------------------------------------------
+        # Render
+        # ------------------------------------------------------------------
+
         bpy.ops.render.render(write_still=True)
 
-        # ── CLEANUP ───────────────────────────────────────────────────────
-        if original_material:
-            obj.data.materials[0] = original_material
+        # ------------------------------------------------------------------
+        # Cleanup and restore
+        # ------------------------------------------------------------------
+
+        if original_mat:
+            obj.data.materials[0] = original_mat
         else:
-            obj.data.materials.pop(index=0)
+            obj.data.materials.clear()
 
-        bpy.data.materials.remove(temp_mat)
+        bpy.data.materials.remove(mat)
         bpy.data.worlds.remove(temp_world)
+        bpy.data.objects.remove(cam, do_unlink=True)
 
-        scene.world                              = original_world
-        scene.camera                             = original_camera
-        scene.render.engine                      = original_engine
-        scene.render.resolution_x                = original_res_x
-        scene.render.resolution_y                = original_res_y
-        scene.render.filepath                    = original_filepath
-        scene.render.image_settings.file_format  = original_format
-        scene.render.image_settings.color_depth  = original_depth
-        scene.render.film_transparent            = original_film_transparent
+        scene.camera = original["camera"]
+        scene.world = original["world"]
+        scene.render.engine = original["engine"]
+        scene.render.resolution_x = original["res_x"]
+        scene.render.resolution_y = original["res_y"]
+        scene.render.filepath = original["filepath"]
+        scene.render.image_settings.file_format = original["format"]
+        scene.render.image_settings.color_depth = original["depth"]
+        scene.view_settings.view_transform = original["view"]
+        scene.view_settings.look = original["look"]
+        scene.view_settings.exposure = original["exposure"]
+        scene.view_settings.gamma = original["gamma"]
 
-        bpy.data.objects.remove(temp_cam, do_unlink=True)
-
-        self.report({'INFO'}, f"Heightmap saved → {output_file}")
-        print(f"[Heightmap Baker] Done. Cleanup complete.")
+        self.report({'INFO'}, f"Heightmap saved: {output_path}")
         return {'FINISHED'}
 
 
 # ---------------------------------------------------------------------------
-# Panel — lives in the Tool tab of the N-panel
+# UI Panel
 # ---------------------------------------------------------------------------
 
 class VIEW3D_PT_heightmap_baker(bpy.types.Panel):
-    bl_label       = "Heightmap Baker"
-    bl_idname      = "VIEW3D_PT_heightmap_baker"
-    bl_space_type  = 'VIEW_3D'
+    bl_label = "Heightmap Baker"
+    bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category    = 'Tool'          # ← "Tool" tab in the N-panel / sidebar
+    bl_category = 'Tool'
 
     def draw(self, context):
         layout = self.layout
-        cfg    = context.scene.heightmap_baker
+        cfg = context.scene.heightmap_baker
 
-        # ── Resolution ───────────────────────────────────────────────────
-        box = layout.box()
-        box.label(text="Resolution", icon='IMAGE_DATA')
-        row = box.row(align=True)
-        row.prop(cfg, "resolution_x", text="W")
-        row.prop(cfg, "resolution_y", text="H")
+        layout.prop(cfg, "resolution_x")
+        layout.prop(cfg, "resolution_y")
+        layout.prop(cfg, "render_engine")
+        layout.prop(cfg, "padding")
+        layout.prop(cfg, "file_format", expand=True)
+        layout.prop(cfg, "bit_depth", expand=True)
+        layout.prop(cfg, "output_dir")
 
-        # ── Options ───────────────────────────────────────────────────────
-        box = layout.box()
-        box.label(text="Options", icon='PREFERENCES')
-        box.prop(cfg, "render_engine")
-        box.prop(cfg, "padding")
-        box.prop(cfg, "file_format", expand=True)
-        box.prop(cfg, "bit_depth", expand=True)
-
-        # ── Output ────────────────────────────────────────────────────────
-        box = layout.box()
-        box.label(text="Output", icon='FOLDER_REDIRECT')
-        box.prop(cfg, "output_dir", text="")
-
-        # ── Action ────────────────────────────────────────────────────────
         layout.separator()
-        obj = context.active_object
-        if obj and obj.type == 'MESH':
-            layout.operator("object.bake_heightmap", icon='RENDER_STILL')
-        else:
-            col = layout.column()
-            col.enabled = False
-            col.label(text="Select a Mesh object", icon='INFO')
-
+        layout.operator("object.bake_heightmap", icon='RENDER_STILL')
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -290,17 +311,20 @@ classes = (
     VIEW3D_PT_heightmap_baker,
 )
 
+
 def register():
-    for cls in classes:
-        bpy.utils.register_class(cls)
+    for c in classes:
+        bpy.utils.register_class(c)
     bpy.types.Scene.heightmap_baker = bpy.props.PointerProperty(
         type=HeightmapBakerSettings
     )
 
+
 def unregister():
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    for c in reversed(classes):
+        bpy.utils.unregister_class(c)
     del bpy.types.Scene.heightmap_baker
+
 
 if __name__ == "__main__":
     register()
