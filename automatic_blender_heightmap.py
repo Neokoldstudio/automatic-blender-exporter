@@ -16,6 +16,7 @@ from bpy.props import (
     FloatProperty,
     EnumProperty,
     StringProperty,
+    BoolProperty,
 )
 
 
@@ -78,6 +79,16 @@ class HeightmapBakerSettings(bpy.types.PropertyGroup):
         name="Output Directory",
         subtype='DIR_PATH',
         default=""
+    )
+
+    output_name: StringProperty(
+        name="Output Name",
+        default="heightmap"
+    )
+
+    invert_height: BoolProperty(
+        name="Invert Height",
+        default=False
     )
 
 
@@ -150,15 +161,15 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
             return {'CANCELLED'}
 
         # ------------------------------------------------------------------
-        # Temporary world (black background)
+        # Temporary world (background color based on invert)
         # ------------------------------------------------------------------
 
         temp_world = bpy.data.worlds.new("TEMP_HEIGHT_WORLD")
         temp_world.use_nodes = True
 
         bg = temp_world.node_tree.nodes["Background"]
-        min_value = 0.0
-        bg.inputs["Color"].default_value = (min_value, min_value, min_value, 1)
+        bg_value = 1.0 if cfg.invert_height else 0.0
+        bg.inputs["Color"].default_value = (bg_value, bg_value, bg_value, 1)
         bg.inputs["Strength"].default_value = 1.0
 
         scene.world = temp_world
@@ -212,8 +223,12 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
 
         n_map.inputs['From Min'].default_value = min_z
         n_map.inputs['From Max'].default_value = max_z
-        n_map.inputs['To Min'].default_value = 0.0
-        n_map.inputs['To Max'].default_value = 1.0
+        if cfg.invert_height:
+            n_map.inputs['To Min'].default_value = 1.0
+            n_map.inputs['To Max'].default_value = 0.0
+        else:
+            n_map.inputs['To Min'].default_value = 0.0
+            n_map.inputs['To Max'].default_value = 1.0
         n_map.clamp = True
 
         links.new(n_geo.outputs['Position'], n_sep.inputs[0])
@@ -261,7 +276,8 @@ class OBJECT_OT_bake_heightmap(bpy.types.Operator):
             out_dir = os.path.expanduser("~")
 
         ext = "exr" if cfg.file_format == 'OPEN_EXR' else "png"
-        output_path = os.path.join(out_dir, f"heightmap.{ext}")
+        output_name = cfg.output_name if cfg.output_name else "heightmap"
+        output_path = os.path.join(out_dir, f"{output_name}.{ext}")
         scene.render.filepath = output_path
 
         # ------------------------------------------------------------------
@@ -329,6 +345,8 @@ class VIEW3D_PT_heightmap_baker(bpy.types.Panel):
         layout.prop(cfg, "file_format", expand=True)
         layout.prop(cfg, "bit_depth", expand=True)
         layout.prop(cfg, "output_dir")
+        layout.prop(cfg, "output_name")
+        layout.prop(cfg, "invert_height")
 
         layout.separator()
         layout.label(text="Supports multiple selected objects", icon='INFO')
